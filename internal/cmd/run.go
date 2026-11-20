@@ -21,16 +21,19 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"path"
 
 	"github.com/ketches/registry-proxy/internal/config"
 	"github.com/ketches/registry-proxy/internal/global"
-	"github.com/ketches/registry-proxy/pkg/image"
+	"github.com/ketches/registry-proxy/internal/health"
+	"github.com/ketches/registry-proxy/internal/mutate"
 	"github.com/ketches/registry-proxy/pkg/util"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
+
+// metricsAddr is the plain-HTTP address the metrics endpoint is served on.
+const metricsAddr = ":8080"
 
 func init() {
 	Init()
@@ -38,12 +41,62 @@ func init() {
 
 // Run starts the registry-proxy admission webhook.
 func Run() {
+	startHealthChecking()
+
 	http.HandleFunc(global.WebhookServicePath, mutatePod)
 	log.Println("Start serving registry-proxy admission webhook ...")
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			health.Default().Metrics().Handler().ServeHTTP(w, r)
+		})
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			log.Printf("Failed to serve metrics endpoint: %v", err)
+		}
+	}()
 
 	if err := http.ListenAndServeTLS(":443", global.WebhookServiceTLSCertFile, global.WebhookServiceTLSKeyFile, nil); err != nil {
 		log.Fatalln("Failed to listen and serve admission webhook.", err.Error())
 	}
+}
+
+// startHealthChecking starts background health checking of the proxy
+// instances referenced by the current rules, and keeps the probe set in sync
+// with rule hot-reloads.
+func startHealthChecking() {
+	syncHealthFromConfig()
+	config.RegisterOnReset(syncHealthFromConfig)
+}
+
+// syncHealthFromConfig applies the current config to the default health checker.
+func syncHealthFromConfig() {
+	cfg, err := config.GetHealthCheck().Parse()
+	if err != nil {
+		// Should not happen: invalid configs are rejected by config.Reset.
+		log.Printf("Invalid health check config, health gating unchanged: %v", err)
+		return
+	}
+	if err := health.ReconfigureDefault(cfg, uniqueProxyAddrs(config.GetProxies())); err != nil {
+		log.Printf("Failed to apply health check config: %v", err)
+	}
+}
+
+// uniqueProxyAddrs returns the distinct proxy addresses referenced by the rules.
+func uniqueProxyAddrs(proxies map[string]string) []string {
+	seen := map[string]struct{}{}
+	var addrs []string
+	for _, addr := range proxies {
+		if addr == "" {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		addrs = append(addrs, addr)
+	}
+	return addrs
 }
 
 // mutatePod is the handler of the admission webhook.
@@ -103,7 +156,7 @@ func patchPod(pod *corev1.Pod) ([]byte, error) {
 
 	log.Printf("Pod %s/%s is included", pod.Namespace, podName)
 
-	replaceImage(pod)
+	mutate.Pod(pod)
 
 	var patches = []map[string]any{
 		{
@@ -149,48 +202,4 @@ func encodeResponse(w http.ResponseWriter, response *admissionv1.AdmissionReview
 		log.Println("Encode response failed.")
 		http.Error(w, fmt.Sprintf("could not encode response: %v", err), http.StatusInternalServerError)
 	}
-}
-
-// replaceImage replaces the image in the pod with the proxy image.
-func replaceImage(pod *corev1.Pod) {
-	for i := range pod.Spec.InitContainers {
-		pod.Spec.InitContainers[i].Image = getProxyImage(pod.Spec.InitContainers[i].Image)
-	}
-
-	for i := range pod.Spec.Containers {
-		pod.Spec.Containers[i].Image = getProxyImage(pod.Spec.Containers[i].Image)
-	}
-
-	for i := range pod.Spec.EphemeralContainers {
-		pod.Spec.EphemeralContainers[i].EphemeralContainerCommon.Image = getProxyImage(pod.Spec.EphemeralContainers[i].EphemeralContainerCommon.Image)
-	}
-}
-
-// getProxyImage gets the proxy image of the raw image.
-func getProxyImage(rawImage string) string {
-	var result = rawImage
-	registry, name, err := image.Parse(rawImage)
-	if err != nil {
-		log.Println("Parse image failed.")
-		return result
-	}
-
-	result = path.Join(getProxyRegistry(registry), name)
-	if result != rawImage {
-		log.Printf("Proxy image: %s -> %s", rawImage, result)
-	}
-	return result
-}
-
-// getProxyRegistry gets the proxy registry of the raw registry.
-func getProxyRegistry(rawRegistry string) string {
-	proxies := config.GetProxies()
-	if proxies == nil {
-		return rawRegistry
-	}
-	newRegistry := proxies[rawRegistry]
-	if newRegistry == "" {
-		return rawRegistry
-	}
-	return newRegistry
 }

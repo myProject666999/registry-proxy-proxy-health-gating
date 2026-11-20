@@ -134,8 +134,11 @@ func tryResetConfigFromConfigMap(cm *corev1.ConfigMap) {
 		data = []byte(cm.Data[global.ConfigMapPath])
 	}
 
-	// reset config
-	config.Reset(data)
+	// reset config; invalid configs are rejected and the current config is kept
+	if err := config.Reset(data); err != nil {
+		log.Printf("Keep current config, reset from ConfigMap failed: %v", err)
+		return
+	}
 
 	// try to update the MutatingWebhookConfiguration
 	applyWebhook()

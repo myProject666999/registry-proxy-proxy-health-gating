@@ -61,6 +61,14 @@ data:
     - "*"
     podSelector: {}
     namespaceSelector: {}
+    healthCheck:
+      enabled: true
+      interval: 10s
+      timeout: 2s
+      failureThreshold: 2
+      successThreshold: 3
+      freshnessTTL: 30s
+      probeImage: library/alpine:latest
 ```
 
 ### 配置说明
@@ -89,6 +97,10 @@ Pod 选择器，键值对形式，默认为空，支持 Pod 选择器，例如�
 
 命名空间选择器，键值对形式，默认为空，支持命名空间选择器，例如：`owner: johndoe`；
 
+**healthCheck：**
+
+代理实例健康检查。开启后（默认开启），只有当规则指向的代理实例健康时才改写镜像；实例不健康或状态未知时保留原始镜像引用并放行，避免新 Pod 拉不到镜像。探测在后台按 `interval` 周期进行（对实例发起镜像清单 `HEAD` 请求），准入决策只读取最近一次结果，不会被探测拖慢；连续 `failureThreshold` 次失败判为不健康，连续 `successThreshold` 次成功判为恢复；最近一次结果超过 `freshnessTTL` 未更新则视为未知。`timeout` 必须小于 `interval`，否则配置会被拒绝。各实例的健康状态与上次状态变化时间通过 `:8080/metrics` 的 Prometheus 指标暴露。详见 [docs/health-gating.md](./docs/health-gating.md)。
+
 ## 实现原理
 
 使用 Mutating Webhook 准入控制器实现。 当集群中 Pod 创建时，Mutating Webhook 的工作流程如下：
@@ -99,7 +111,8 @@ Pod 选择器，键值对形式，默认为空，支持 Pod 选择器，例如�
 4. 通过 `namespaceSelector` 参数命名空间标签，如果匹配，继续流程；
 5. 通过 `podSelector` 参数匹配 Pod 标签，如果匹配，继续流程；
 6. 通过 `proxies` 参数判断 Pod 中的容器镜像是否需要代理，如果是，继续流程；
-7. 通过 `proxies` 参数替换容器镜像地址，完成代理，Mutating Webhook 响应请求，结束流程。
+7. 通过 `healthCheck` 后台探测结果判断对应代理实例是否健康，如果健康，继续流程（不健康或未知则保留原始镜像地址）；
+8. 通过 `proxies` 参数替换容器镜像地址，完成代理，Mutating Webhook 响应请求，结束流程。
 
 ![schematic.png](./docs/images/schematic.png)
 
